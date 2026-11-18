@@ -68,6 +68,7 @@ const (
 	eventDeleteEndpoint
 	eventUpdateNode
 	eventDeleteNode
+	eventUpdateDevices
 )
 
 type Config struct {
@@ -268,6 +269,9 @@ func newEgressGatewayManager(p Params) (*Manager, error) {
 			wg.Go(func() {
 				manager.processEvents(ctx)
 			})
+			wg.Go(func() {
+				manager.watchDevices(ctx)
+			})
 
 			return nil
 		},
@@ -310,6 +314,29 @@ func (manager *Manager) getIdentityLabels(securityIdentity uint32) (labels.Label
 		return nil, fmt.Errorf("identity %d not found", securityIdentity)
 	}
 	return identity.Labels, nil
+}
+
+// watchDevices triggers a regeneration of the gateway configs whenever the
+// devices or their addresses change, so that the egress ifindex follows
+// interfaces that are recreated with a new index or name.
+func (manager *Manager) watchDevices(ctx context.Context) {
+	for {
+		txn := manager.db.ReadTxn()
+		_, devWatch := manager.deviceTable.AllWatch(txn)
+		_, addrWatch := manager.nodeAddrTable.AllWatch(txn)
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-devWatch:
+		case <-addrWatch:
+		}
+
+		manager.Lock()
+		manager.setEventBitmap(eventUpdateDevices)
+		manager.Unlock()
+		manager.reconciliationTrigger.TriggerWithReason("devices updated")
+	}
 }
 
 // processEvents spawns a goroutine that waits for the agent to
@@ -892,7 +919,7 @@ func (manager *Manager) reconcileLocked() {
 		manager.updatePoliciesMatchedEndpointIDs()
 	}
 
-	if manager.eventBitmapIsSet(eventK8sSyncDone, eventAddPolicy, eventDeletePolicy, eventUpdateNode, eventDeleteNode) {
+	if manager.eventBitmapIsSet(eventK8sSyncDone, eventAddPolicy, eventDeletePolicy, eventUpdateNode, eventDeleteNode, eventUpdateDevices) {
 		manager.regenerateGatewayConfigs()
 
 		// Sysctl updates are handled by a reconciler, with the initial update attempting to wait some time
