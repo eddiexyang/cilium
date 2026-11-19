@@ -1773,7 +1773,7 @@ __snat_v6_needs_masquerade(struct __ctx_buff *ctx, struct ipv6_ct_tuple *tuple,
 	if (egress_gw_snat_needed_hook_v6(&tuple->saddr, &tuple->daddr, &target->addr,
 					  &target->ifindex)) {
 		if (ipv6_addr_equals(&target->addr, &EGRESS_GATEWAY_NO_EGRESS_IP_V6))
-			return DROP_NO_EGRESS_IP;
+			return target->ifindex ? NAT_PUNT_TO_STACK : DROP_NO_EGRESS_IP;
 
 		target->egress_gateway = true;
 		/* If the endpoint is local, then the connection is already tracked. */

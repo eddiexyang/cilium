@@ -120,7 +120,8 @@ static __always_inline int handle_ipv6(struct __ctx_buff *ctx,
 						  &egress_ifindex)) {
 			__u32 tbid = EGRESS_GATEWAY_RT_TBID;
 
-			if (ipv6_addr_equals(&snat_addr, &EGRESS_GATEWAY_NO_EGRESS_IP_V6))
+			if (ipv6_addr_equals(&snat_addr, &EGRESS_GATEWAY_NO_EGRESS_IP_V6) &&
+			    !egress_ifindex)
 				return DROP_NO_EGRESS_IP;
 
 			ret = ipv6_l3(ctx, ETH_HLEN, NULL, NULL, METRIC_INGRESS);

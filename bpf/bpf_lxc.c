@@ -734,7 +734,8 @@ ipv6_forward_to_destination(struct __ctx_buff *ctx, struct ipv6hdr *ip6,
 			if (gateway_node_ep && (gateway_node_ep->flags & ENDPOINT_F_HOST)) {
 				__u32 tbid = CONFIG(rt_info);
 
-				if (ipv6_addr_equals(&egress_ip, &EGRESS_GATEWAY_NO_EGRESS_IP_V6))
+				if (ipv6_addr_equals(&egress_ip, &EGRESS_GATEWAY_NO_EGRESS_IP_V6) &&
+				    !egress_ifindex)
 					return DROP_NO_EGRESS_IP;
 
 				ret = ipv6_l3(ctx, ETH_HLEN, NULL, NULL, METRIC_EGRESS);

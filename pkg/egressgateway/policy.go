@@ -226,10 +226,6 @@ func (gwc *gatewayConfig) deriveFromPolicyGatewayConfig(manager *Manager, gc *po
 			if v4Needed && !egressIP4.IsValid() {
 				return fmt.Errorf("failed to retrieve IPv4 address for egress interface")
 			}
-
-			if v6Needed && !egressIP6.IsValid() {
-				return fmt.Errorf("failed to retrieve IPv6 address for egress interface")
-			}
 		} else {
 			iface, err := safenetlink.LinkByName(gwc.ifaceName)
 			if err != nil {
@@ -246,9 +242,8 @@ func (gwc *gatewayConfig) deriveFromPolicyGatewayConfig(manager *Manager, gc *po
 			}
 
 			if v6Needed {
-				egressIP6, err = netdevice.GetIfaceFirstIPv6Address(gc.iface)
-				if err != nil {
-					return fmt.Errorf("failed to retrieve IPv6 address for egress interface: %w", err)
+				if ip6, err := netdevice.GetIfaceFirstIPv6Address(gc.iface); err == nil {
+					egressIP6 = ip6
 				}
 			}
 		}
@@ -265,9 +260,6 @@ func (gwc *gatewayConfig) deriveFromPolicyGatewayConfig(manager *Manager, gc *po
 
 				if v6Needed {
 					_, egressIP6 = deviceGetPrimaryAddresses(manager, dev.Name)
-					if !egressIP6.IsValid() {
-						return fmt.Errorf("failed to retrieve IPv6 address for egress interface")
-					}
 				}
 			} else if gc.egressIP.Is6() {
 				egressIP6 = gc.egressIP
@@ -289,9 +281,8 @@ func (gwc *gatewayConfig) deriveFromPolicyGatewayConfig(manager *Manager, gc *po
 				}
 
 				if v6Needed {
-					egressIP6, err = netdevice.GetIfaceFirstIPv6Address(gwc.ifaceName)
-					if err != nil {
-						return fmt.Errorf("failed to retrieve IPv6 address for egress interface: %w", err)
+					if ip6, err := netdevice.GetIfaceFirstIPv6Address(gwc.ifaceName); err == nil {
+						egressIP6 = ip6
 					}
 				}
 			} else if gc.egressIP.Is6() {
