@@ -170,22 +170,25 @@ lookup_ip4_egress_gw_policy_v2(__be32 saddr, __be32 daddr)
 # endif /* ENABLE_EGRESS_GATEWAY */
 
 static __always_inline int
-egress_gw_request_needs_redirect(struct ipv4_ct_tuple *rtuple __maybe_unused,
-				 __be32 *gateway_ip __maybe_unused)
+egress_gw_lookup_v4(__be32 saddr __maybe_unused,
+		    __be32 daddr __maybe_unused,
+		    __be32 *gateway_ip __maybe_unused,
+		    __be32 *egress_ip __maybe_unused,
+		    __u32 *egress_ifindex __maybe_unused)
 {
 #if defined(ENABLE_EGRESS_GATEWAY)
 	const struct egress_gw_policy_entry_v2 *egress_gw_policy_v2;
 	const struct egress_gw_policy_entry *egress_gw_policy;
+	__u32 ifindex = 0;
 
-	egress_gw_policy_v2 = lookup_ip4_egress_gw_policy_v2(ipv4_ct_reverse_tuple_saddr(rtuple),
-							     ipv4_ct_reverse_tuple_daddr(rtuple));
+	egress_gw_policy_v2 = lookup_ip4_egress_gw_policy_v2(saddr, daddr);
 	if (egress_gw_policy_v2) {
 		egress_gw_policy = (struct egress_gw_policy_entry *)egress_gw_policy_v2;
+		ifindex = egress_gw_policy_v2->egress_ifindex;
 		goto evaluate_policy;
 	}
 
-	egress_gw_policy = lookup_ip4_egress_gw_policy(ipv4_ct_reverse_tuple_saddr(rtuple),
-						       ipv4_ct_reverse_tuple_daddr(rtuple));
+	egress_gw_policy = lookup_ip4_egress_gw_policy(saddr, daddr);
 	if (!egress_gw_policy)
 		return CTX_ACT_OK;
 
@@ -198,11 +201,31 @@ evaluate_policy:
 		return CTX_ACT_OK;
 	}
 
-	*gateway_ip = egress_gw_policy->gateway_ip;
+	if (gateway_ip)
+		*gateway_ip = egress_gw_policy->gateway_ip;
+	if (egress_ip)
+		*egress_ip = egress_gw_policy->egress_ip;
+	if (egress_ifindex)
+		*egress_ifindex = ifindex;
 	return CTX_ACT_REDIRECT;
 #else
 	return CTX_ACT_OK;
 #endif /* ENABLE_EGRESS_GATEWAY */
+}
+
+static __always_inline bool
+egress_gw_policy_matches_v4(__be32 saddr, __be32 daddr)
+{
+	return egress_gw_lookup_v4(saddr, daddr, NULL, NULL, NULL) != CTX_ACT_OK;
+}
+
+static __always_inline int
+egress_gw_request_needs_redirect(struct ipv4_ct_tuple *rtuple __maybe_unused,
+				 __be32 *gateway_ip __maybe_unused)
+{
+	return egress_gw_lookup_v4(ipv4_ct_reverse_tuple_saddr(rtuple),
+				   ipv4_ct_reverse_tuple_daddr(rtuple),
+				   gateway_ip, NULL, NULL);
 }
 
 static __always_inline
@@ -288,17 +311,6 @@ static __always_inline
 bool egress_gw_snat_needed_hook(__be32 saddr, __be32 daddr, __be32 *snat_addr,
 				__u32 *egress_ifindex)
 {
-	const struct remote_endpoint_info *remote_ep;
-
-	remote_ep = lookup_ip4_remote_endpoint(daddr, 0);
-	/* If the packet is destined to an entity inside the cluster, either EP
-	 * or node, skip SNAT since only traffic leaving the cluster is supposed
-	 * to be masqueraded with an egress IP.
-	 */
-	if (remote_ep &&
-	    identity_is_cluster(remote_ep->sec_identity))
-		return false;
-
 	return egress_gw_snat_needed(saddr, daddr, snat_addr, egress_ifindex);
 }
 
@@ -324,16 +336,9 @@ bool egress_gw_reply_needs_redirect_hook(struct iphdr *ip4, __u32 *tunnel_endpoi
 
 static __always_inline
 int egress_gw_handle_packet(struct ipv4_ct_tuple *tuple,
-			    __u32 dst_sec_identity, __be32 *gateway_ip)
+			    __u32 dst_sec_identity __maybe_unused,
+			    __be32 *gateway_ip)
 {
-	/* If the packet is destined to an entity inside the cluster,
-	 * either EP or node, it should not be forwarded to an egress
-	 * gateway since only traffic leaving the cluster is supposed to
-	 * be masqueraded with an egress IP.
-	 */
-	if (identity_is_cluster(dst_sec_identity))
-		return CTX_ACT_OK;
-
 	return egress_gw_request_needs_redirect_hook(tuple, gateway_ip);
 }
 
@@ -352,17 +357,16 @@ lookup_ip6_egress_gw_policy(const union v6addr *saddr, const union v6addr *daddr
 #endif /* ENABLE_EGRESS_GATEWAY */
 
 static __always_inline int
-egress_gw_request_needs_redirect_v6(struct ipv6_ct_tuple *rtuple __maybe_unused,
-				    __be32 *gateway_ip __maybe_unused)
+egress_gw_lookup_v6(const union v6addr *saddr __maybe_unused,
+		    const union v6addr *daddr __maybe_unused,
+		    __be32 *gateway_ip __maybe_unused,
+		    union v6addr *egress_ip __maybe_unused,
+		    __u32 *egress_ifindex __maybe_unused)
 {
 #if defined(ENABLE_EGRESS_GATEWAY)
 	const struct egress_gw_policy_entry6 *egress_gw_policy;
-	union v6addr saddr, daddr;
 
-	saddr = ipv6_ct_reverse_tuple_saddr(rtuple);
-	daddr = ipv6_ct_reverse_tuple_daddr(rtuple);
-
-	egress_gw_policy = lookup_ip6_egress_gw_policy(&saddr, &daddr);
+	egress_gw_policy = lookup_ip6_egress_gw_policy(saddr, daddr);
 	if (!egress_gw_policy)
 		return CTX_ACT_OK;
 
@@ -374,11 +378,32 @@ egress_gw_request_needs_redirect_v6(struct ipv6_ct_tuple *rtuple __maybe_unused,
 		return CTX_ACT_OK;
 	}
 
-	*gateway_ip = egress_gw_policy->gateway_ip;
+	if (gateway_ip)
+		*gateway_ip = egress_gw_policy->gateway_ip;
+	if (egress_ip)
+		*egress_ip = egress_gw_policy->egress_ip;
+	if (egress_ifindex)
+		*egress_ifindex = egress_gw_policy->egress_ifindex;
 	return CTX_ACT_REDIRECT;
 #else
 	return CTX_ACT_OK;
 #endif /* ENABLE_EGRESS_GATEWAY */
+}
+
+static __always_inline bool
+egress_gw_policy_matches_v6(const union v6addr *saddr, const union v6addr *daddr)
+{
+	return egress_gw_lookup_v6(saddr, daddr, NULL, NULL, NULL) != CTX_ACT_OK;
+}
+
+static __always_inline int
+egress_gw_request_needs_redirect_v6(struct ipv6_ct_tuple *rtuple __maybe_unused,
+				    __be32 *gateway_ip __maybe_unused)
+{
+	union v6addr saddr = ipv6_ct_reverse_tuple_saddr(rtuple);
+	union v6addr daddr = ipv6_ct_reverse_tuple_daddr(rtuple);
+
+	return egress_gw_lookup_v6(&saddr, &daddr, gateway_ip, NULL, NULL);
 }
 
 static __always_inline
@@ -439,16 +464,6 @@ static __always_inline
 bool egress_gw_snat_needed_hook_v6(union v6addr *saddr, union v6addr *daddr,
 				   union v6addr *snat_addr, __u32 *egress_ifindex)
 {
-	const struct remote_endpoint_info *remote_ep;
-
-	remote_ep = lookup_ip6_remote_endpoint(daddr, 0);
-	/* If the packet is destined to an entity inside the cluster, either EP
-	 * or node, skip SNAT since only traffic leaving the cluster is supposed
-	 * to be masqueraded with an egress IP.
-	 */
-	if (remote_ep && identity_is_cluster(remote_ep->sec_identity))
-		return false;
-
 	return egress_gw_snat_needed_v6(saddr, daddr, snat_addr, egress_ifindex);
 }
 
@@ -521,16 +536,9 @@ bool egress_gw_reply_needs_redirect_hook_v6(struct ipv6hdr *ip6,
 
 static __always_inline
 int egress_gw_handle_packet_v6(struct ipv6_ct_tuple *tuple,
-			       __u32 dst_sec_identity, __be32 *gateway_ip)
+			       __u32 dst_sec_identity __maybe_unused,
+			       __be32 *gateway_ip)
 {
-	/* If the packet is destined to an entity inside the cluster,
-	 * either EP or node, it should not be forwarded to an egress
-	 * gateway since only traffic leaving the cluster is supposed to
-	 * be masqueraded with an egress IP.
-	 */
-	if (identity_is_cluster(dst_sec_identity))
-		return CTX_ACT_OK;
-
 	return egress_gw_request_needs_redirect_hook_v6(tuple, gateway_ip);
 }
 #endif /* ENABLE_IPV6 */

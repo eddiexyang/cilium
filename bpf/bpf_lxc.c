@@ -160,6 +160,11 @@ static __always_inline int __per_packet_lb_svc_xlate_4(void *ctx, struct iphdr *
 	fraginfo = ipfrag_encode_ipv4(ip4);
 	l4_off = ETH_HLEN + ipv4_hdrlen(ip4);
 
+#ifdef ENABLE_EGRESS_GATEWAY_COMMON
+	if (egress_gw_policy_matches_v4(ip4->saddr, ip4->daddr))
+		goto skip_service_lookup;
+#endif
+
 	ret = lb4_extract_tuple(ctx, ip4, fraginfo, l4_off, &tuple);
 	if (IS_ERR(ret)) {
 		if (ret == DROP_UNSUPP_SERVICE_PROTO || ret == DROP_UNKNOWN_L4)
@@ -332,6 +337,12 @@ static __always_inline int __per_packet_lb_svc_xlate_6(void *ctx, struct ipv6hdr
 		return ret;
 
 	l4_off = ETH_HLEN + ret;
+
+#ifdef ENABLE_EGRESS_GATEWAY_COMMON
+	if (egress_gw_policy_matches_v6((const union v6addr *)&ip6->saddr,
+					(const union v6addr *)&ip6->daddr))
+		goto skip_service_lookup;
+#endif
 
 	ret = lb6_extract_tuple(ctx, ip6, fraginfo, l4_off, &tuple);
 	if (IS_ERR(ret)) {
@@ -662,6 +673,7 @@ ipv6_forward_to_destination(struct __ctx_buff *ctx, struct ipv6hdr *ip6,
 			    bool hairpin_flow,
 			    bool from_l7lb,
 			    __u16 proxy_port,
+			    bool skip_egw __maybe_unused,
 			    struct trace_ctx *trace,
 			    __s8 *ext_err)
 {
@@ -700,6 +712,51 @@ ipv6_forward_to_destination(struct __ctx_buff *ctx, struct ipv6hdr *ip6,
 				  trace->reason, trace->monitor, bpf_htons(ETH_P_IPV6));
 		return ctx_redirect_to_proxy6(ctx, tuple, proxy_port, false);
 	}
+
+#if defined(ENABLE_EGRESS_GATEWAY_COMMON)
+	if (!skip_egw && ct_status != CT_REPLY && ct_status != CT_RELATED) {
+		__be32 gateway_ip = 0;
+		union v6addr egress_ip = {}, daddr = {};
+		__u32 egress_ifindex = 0;
+
+		ipv6_addr_copy(&daddr, (union v6addr *)&ip6->daddr);
+		ret = egress_gw_lookup_v6((const union v6addr *)&ip6->saddr,
+					  &daddr, &gateway_ip, &egress_ip,
+					  &egress_ifindex);
+		if (IS_ERR(ret))
+			return ret;
+
+		if (ret == CTX_ACT_REDIRECT) {
+			const struct endpoint_info *gateway_node_ep;
+			struct remote_endpoint_info fake_info = {0};
+
+			gateway_node_ep = __lookup_ip4_endpoint(gateway_ip);
+			if (gateway_node_ep && (gateway_node_ep->flags & ENDPOINT_F_HOST)) {
+				__u32 tbid = CONFIG(rt_info);
+
+				if (ipv6_addr_equals(&egress_ip, &EGRESS_GATEWAY_NO_EGRESS_IP_V6))
+					return DROP_NO_EGRESS_IP;
+
+				ret = ipv6_l3(ctx, ETH_HLEN, NULL, NULL, METRIC_EGRESS);
+				if (unlikely(ret != CTX_ACT_OK))
+					return ret;
+
+				set_identity_mark(ctx, SECLABEL_IPV6, MARK_MAGIC_EGW_DONE);
+
+				/* to-netdev@bpf_host handles SNAT */
+				return egress_gw_fib_lookup_and_redirect_v6(ctx, &egress_ip,
+									    &daddr, egress_ifindex,
+									    tbid, ext_err);
+			}
+
+			fake_info.tunnel_endpoint.ip4.be32 = gateway_ip;
+			fake_info.flag_has_tunnel_ep = true;
+			return encap_and_redirect_with_nodeid(ctx, &fake_info,
+							      SECLABEL_IPV6, dst_sec_identity,
+							      trace, bpf_htons(ETH_P_IPV6));
+		}
+	}
+#endif /* ENABLE_EGRESS_GATEWAY_COMMON */
 
 #if defined(ENABLE_HOST_FIREWALL) && !defined(ENABLE_ROUTING)
 	/* If the destination is the local host and per-endpoint routes are
@@ -1049,6 +1106,7 @@ ct_recreate6:
 	return ipv6_forward_to_destination(ctx, ip6, tuple, *dst_sec_identity,
 					   ct_state, ct_status, info, skip_tunnel,
 					   hairpin_flow, from_l7lb, proxy_port,
+					   ct_state->rev_nat_index || ct_state_new.rev_nat_index,
 					   &trace, ext_err);
 }
 
@@ -1144,6 +1202,7 @@ ipv4_forward_to_destination(struct __ctx_buff *ctx, struct iphdr *ip4,
 			    bool hairpin_flow,
 			    bool from_l7lb,
 			    __u16 proxy_port,
+			    bool skip_egw __maybe_unused,
 			    __u32 cluster_id __maybe_unused,
 			    struct trace_ctx *trace,
 			    __s8 *ext_err)
@@ -1184,6 +1243,48 @@ ipv4_forward_to_destination(struct __ctx_buff *ctx, struct iphdr *ip4,
 				  trace->reason, trace->monitor, bpf_htons(ETH_P_IP));
 		return ctx_redirect_to_proxy4(ctx, tuple, proxy_port, false);
 	}
+
+#if defined(ENABLE_EGRESS_GATEWAY_COMMON)
+	if (!skip_egw && ct_status != CT_REPLY && ct_status != CT_RELATED) {
+		__be32 gateway_ip = 0, egress_ip = 0, daddr = ip4->daddr;
+		__u32 egress_ifindex = 0;
+
+		ret = egress_gw_lookup_v4(ip4->saddr, daddr,
+					  &gateway_ip, &egress_ip,
+					  &egress_ifindex);
+		if (IS_ERR(ret))
+			return ret;
+
+		if (ret == CTX_ACT_REDIRECT) {
+			const struct endpoint_info *gateway_node_ep;
+
+			gateway_node_ep = __lookup_ip4_endpoint(gateway_ip);
+			if (gateway_node_ep && (gateway_node_ep->flags & ENDPOINT_F_HOST)) {
+				__u32 tbid = CONFIG(rt_info);
+
+				if (egress_ip == EGRESS_GATEWAY_NO_EGRESS_IP)
+					return DROP_NO_EGRESS_IP;
+
+				ret = ipv4_l3(ctx, ETH_HLEN, NULL, NULL, ip4);
+				if (unlikely(ret != CTX_ACT_OK))
+					return ret;
+
+				set_identity_mark(ctx, SECLABEL_IPV4, MARK_MAGIC_EGW_DONE);
+
+				/* to-netdev@bpf_host handles SNAT */
+				return egress_gw_fib_lookup_and_redirect(ctx, egress_ip,
+									 daddr, egress_ifindex,
+									 tbid, ext_err);
+			}
+
+			fake_info.tunnel_endpoint.ip4.be32 = gateway_ip;
+			fake_info.flag_has_tunnel_ep = true;
+			return encap_and_redirect_with_nodeid(ctx, &fake_info,
+							      SECLABEL_IPV4, dst_sec_identity,
+							      trace, bpf_htons(ETH_P_IP));
+		}
+	}
+#endif /* ENABLE_EGRESS_GATEWAY_COMMON */
 
 #if defined(ENABLE_HOST_FIREWALL) && !defined(ENABLE_ROUTING)
 	/* If the destination is the local host and per-endpoint routes are
@@ -1638,6 +1739,7 @@ ct_recreate4:
 	return ipv4_forward_to_destination(ctx, ip4, tuple, *dst_sec_identity,
 					   ct_state, ct_status, info, skip_tunnel,
 					   hairpin_flow, from_l7lb, proxy_port,
+					   ct_state->rev_nat_index || ct_state_new.rev_nat_index,
 					   cluster_id, &trace, ext_err);
 }
 
